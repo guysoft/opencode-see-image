@@ -33,6 +33,10 @@ type SeeImageConfig = {
   timeout: number
   apiVersion: string
   userAgent: string
+  // Whether provider/model were explicitly set (via options or env), as
+  // opposed to falling back to the built-in defaults.
+  explicitProvider: boolean
+  explicitModel: boolean
 }
 
 const DEFAULT_ENDPOINT = "https://opencode.ai/zen/go/v1/messages"
@@ -45,14 +49,22 @@ const DEFAULT_USER_AGENT =
 
 function resolveConfig(options: SeeImageOptions = {}): SeeImageConfig {
   const envTimeout = parseInt(process.env.SEE_IMAGE_TIMEOUT || "", 10)
+  const provider = options.provider || process.env.SEE_IMAGE_PROVIDER || DEFAULT_PROVIDER
+  const model = options.model || process.env.SEE_IMAGE_MODEL || DEFAULT_MODEL
+  const timeout =
+    options.timeout ?? (Number.isFinite(envTimeout) ? envTimeout : DEFAULT_TIMEOUT)
   return {
-    provider: options.provider || process.env.SEE_IMAGE_PROVIDER || DEFAULT_PROVIDER,
-    model: options.model || process.env.SEE_IMAGE_MODEL || DEFAULT_MODEL,
+    provider,
+    model,
     endpoint: options.endpoint || process.env.SEE_IMAGE_ENDPOINT || DEFAULT_ENDPOINT,
     apiKey: options.apiKey || process.env.SEE_IMAGE_API_KEY,
-    timeout: options.timeout ?? (Number.isFinite(envTimeout) ? envTimeout : DEFAULT_TIMEOUT),
+    // Guard against 0/negative/non-finite timeouts that would fire timers
+    // immediately or behave unpredictably.
+    timeout: Number.isFinite(timeout) && timeout > 0 ? timeout : DEFAULT_TIMEOUT,
     apiVersion: options.apiVersion || process.env.SEE_IMAGE_API_VERSION || DEFAULT_API_VERSION,
     userAgent: options.userAgent || process.env.SEE_IMAGE_USER_AGENT || DEFAULT_USER_AGENT,
+    explicitProvider: !!(options.provider || process.env.SEE_IMAGE_PROVIDER),
+    explicitModel: !!(options.model || process.env.SEE_IMAGE_MODEL),
   }
 }
 
@@ -173,8 +185,11 @@ async function seeImageViaSDK(
     if (envProvider && envModel) {
       candidates.push({ providerID: envProvider, modelID: envModel })
     }
-    // Config-provided route (highest priority, from plugin options).
-    if (cfg.provider && cfg.model) {
+    // Config-provided route (highest priority, from plugin options or env).
+    // Only add it when provider/model were explicitly configured — the
+    // defaults are always truthy and would otherwise defeat the credential
+    // guard below by unconditionally trying opencode-go/minimax-m3.
+    if (cfg.explicitProvider && cfg.explicitModel) {
       candidates.unshift({ providerID: cfg.provider, modelID: cfg.model })
     }
     // Only try the paid opencode-go model if the user actually has that sub
@@ -198,46 +213,47 @@ async function seeImageViaSDK(
       }
 
       let sessionID: string | undefined
+      const createController = new AbortController()
+      const onCreateAbort = () => createController.abort()
+      abort?.addEventListener("abort", onCreateAbort)
+      const createTimer = setTimeout(() => createController.abort(), cfg.timeout)
       try {
-        const sessionRes = await Promise.race([
-          client.session.create({ body: {} }),
-          new Promise<never>((_, reject) =>
-            setTimeout(
-              () => reject(new Error(`session.create timed out after ${cfg.timeout}ms`)),
-              cfg.timeout,
-            ),
-          ),
-        ])
+        const sessionRes = await client.session.create({
+          body: {},
+          signal: createController.signal,
+        })
         sessionID = sessionRes.data?.id
         if (!sessionID) {
           errors.push(`${providerID}/${modelID}: no session ID`)
           continue
         }
+      } catch (e: any) {
+        errors.push(`${providerID}/${modelID}: session.create: ${e?.message ?? e}`)
+        continue
+      } finally {
+        clearTimeout(createTimer)
+        abort?.removeEventListener("abort", onCreateAbort)
+      }
 
-        const controller = new AbortController()
-        const onAbort = () => controller.abort()
-        abort?.addEventListener("abort", onAbort)
-        const timer = setTimeout(() => controller.abort(), cfg.timeout)
-        let res
-        try {
-          res = await client.session.prompt({
-            path: { id: sessionID },
-            body: {
-              model: { providerID, modelID },
-              parts: [
-                { type: "file", mime: mediaType, url: dataUrl },
-                { type: "text", text: prompt },
-              ],
-              tools: {},
-              system:
-                "You are a vision assistant. Describe the image accurately and concisely. Answer with text only.",
-            },
-            signal: controller.signal,
-          })
-        } finally {
-          clearTimeout(timer)
-          abort?.removeEventListener("abort", onAbort)
-        }
+      const controller = new AbortController()
+      const onAbort = () => controller.abort()
+      abort?.addEventListener("abort", onAbort)
+      const timer = setTimeout(() => controller.abort(), cfg.timeout)
+      try {
+        const res = await client.session.prompt({
+          path: { id: sessionID },
+          body: {
+            model: { providerID, modelID },
+            parts: [
+              { type: "file", mime: mediaType, url: dataUrl },
+              { type: "text", text: prompt },
+            ],
+            tools: {},
+            system:
+              "You are a vision assistant. Describe the image accurately and concisely. Answer with text only.",
+          },
+          signal: controller.signal,
+        })
 
         const parts = res.data?.parts ?? []
         const text = (parts as any[])
@@ -255,6 +271,8 @@ async function seeImageViaSDK(
       } catch (e: any) {
         errors.push(`${providerID}/${modelID}: ${e?.message ?? e}`)
       } finally {
+        clearTimeout(timer)
+        abort?.removeEventListener("abort", onAbort)
         if (sessionID) {
           await client.session
             .delete({ path: { id: sessionID } })
@@ -264,10 +282,12 @@ async function seeImageViaSDK(
     }
 
     if (!result) {
+      // Only use the explicitly selected provider's credential. Falling back
+      // to the unrelated opencode-go key could disclose it to a custom
+      // endpoint and authenticate with the wrong provider.
       const apiKey =
         cfg.apiKey ||
-        (cfg.provider && readProviderKey(cfg.provider)) ||
-        readProviderKey("opencode-go")
+        (cfg.explicitProvider && readProviderKey(cfg.provider))
       if (apiKey) {
         try {
           result = await seeImageViaHTTP(b64, mediaType, prompt, cfg, abort, apiKey)
@@ -319,17 +339,27 @@ async function seeImageViaHTTP(
     ],
   }
 
-  const res = await fetch(cfg.endpoint, {
-    method: "POST",
-    headers: {
-      "x-api-key": key,
-      "anthropic-version": cfg.apiVersion,
-      "content-type": "application/json",
-      "user-agent": cfg.userAgent,
-    },
-    body: JSON.stringify(body),
-    signal: abort,
-  })
+  const controller = new AbortController()
+  const onAbort = () => controller.abort()
+  abort?.addEventListener("abort", onAbort)
+  const timer = setTimeout(() => controller.abort(), cfg.timeout)
+  let res: Response
+  try {
+    res = await fetch(cfg.endpoint, {
+      method: "POST",
+      headers: {
+        "x-api-key": key,
+        "anthropic-version": cfg.apiVersion,
+        "content-type": "application/json",
+        "user-agent": cfg.userAgent,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    })
+  } finally {
+    clearTimeout(timer)
+    abort?.removeEventListener("abort", onAbort)
+  }
 
   if (!res.ok) {
     const errText = await res.text()
